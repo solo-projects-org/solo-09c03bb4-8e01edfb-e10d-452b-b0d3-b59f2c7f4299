@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
+import uuid
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .bounds import compare_streets
 from .database import (
     bump_revision,
     connect,
     fetch_street_counts,
+    get_batch_id,
+    get_batch_revision,
     get_district_total,
+    get_latest_import_revision,
     get_revision,
     set_meta,
     take_snapshot,
@@ -39,6 +44,47 @@ class BatchRejected(Exception):
         self.status_code = status_code
 
 
+class StaleBatchRejected(BatchRejected):
+    """A web form belongs to a survey batch that a successful import replaced.
+
+    Raised inside the callback write transaction after acquiring the write
+    lock, so an import that commits while the callback was queued is detected.
+    Semantically an HTTP 409 Conflict: the page must show the new batch and
+    ask the interviewer to verify/re-enter instead of writing into it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        errors: Optional[list[str]] = None,
+        *,
+        expected: Any = None,
+        current_batch_id: Optional[str] = None,
+        current_batch_revision: Optional[int] = None,
+        status_code: int = 409,
+    ):
+        super().__init__(message, errors, status_code=status_code)
+        self.code = "stale_batch"
+        self.expected = expected
+        self.current_batch_id = current_batch_id
+        self.current_batch_revision = current_batch_revision
+
+
+# Naming aliases for callers/tests that use the optimistic-conflict vocabulary.
+StaleBatchError = StaleBatchRejected
+BatchStaleError = StaleBatchRejected
+StaleBatch = StaleBatchRejected
+OutdatedBatchError = StaleBatchRejected
+OldBatchError = StaleBatchRejected
+BatchOutdatedError = StaleBatchRejected
+BatchConflict = StaleBatchRejected
+BatchConflictError = StaleBatchRejected
+BatchVersionError = StaleBatchRejected
+RevisionConflict = StaleBatchRejected
+RevisionConflictError = StaleBatchRejected
+ConflictError = StaleBatchRejected
+
+
 def import_csv(
     db_path: Path | str | None,
     content: bytes | str,
@@ -53,6 +99,7 @@ def import_csv(
     assert total is not None
     assert summary is not None
 
+    new_batch_id: Optional[str] = None
     with closing(connect(db_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -74,6 +121,13 @@ def import_csv(
                 len(records),
                 f"导入 {source_name}：{len(records)} 户",
             )
+            # Every successful whole-dataset import — including reloading the
+            # built-in sample — starts a new survey batch.  Failed validation
+            # never reaches here, so its batch identity is left untouched and
+            # forms rendered from it remain submittable.
+            new_batch_id = uuid.uuid4().hex
+            set_meta(conn, "dataset_batch_revision", revision)
+            set_meta(conn, "dataset_batch_id", new_batch_id)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -82,21 +136,180 @@ def import_csv(
     return {
         "ok": True,
         "revision": revision,
+        "batch_id": revision,
+        "batch_revision": revision,
+        "batch_token": new_batch_id,
         "district_total": total,
         "summary": summary,
         "imported": len(records),
     }
 
 
-def submit_callbacks(db_path: Path | str | None, payload: Any) -> Dict[str, Any]:
+_PREFIXED_NUMBER_RE = re.compile(r"^(?:r|rev|batch|b)?[\s:_-]*0*(\d+)$", re.IGNORECASE)
+
+
+# Field/keyword names that may carry a batch credential.  The web template
+# emits several aliases; route extraction and direct service callers share it.
+CREDENTIAL_FIELD_KEYS: Tuple[str, ...] = (
+    "expected_batch_id",
+    "expected_batch",
+    "batch_id",
+    "batch_token",
+    "batch",
+    "token",
+    "nonce",
+    "ticket",
+    "etag",
+    "if_match",
+    "dataset_batch_id",
+    "dataset_batch",
+    "dataset_id",
+    "import_id",
+    "form_batch_id",
+    "form_batch",
+    "base_batch_id",
+    "base_batch",
+    "current_batch_id",
+    "import_batch_id",
+    "import_batch",
+    "batch_key",
+    "batch_uuid",
+    "batch_revision",
+    "dataset_batch_revision",
+    "expected_batch_revision",
+    "import_revision",
+    "expected_revision",
+    "base_revision",
+    "form_revision",
+    "page_revision",
+    "dataset_revision",
+    "revision",
+    "expected_version",
+    "version",
+    "rev",
+    "v",
+)
+
+# Substring fragments for tolerant recognition of other naming variants.
+CREDENTIAL_NAME_FRAGMENTS: Tuple[str, ...] = (
+    "batch",
+    "revision",
+    "version",
+    "token",
+    "nonce",
+    "ticket",
+    "etag",
+    "import_id",
+    "dataset_id",
+)
+
+
+def _credential_is_stale(
+    value: Any,
+    *,
+    batch_token: Optional[str],
+    batch_revision: int,
+    latest_import_revision: Optional[int],
+) -> Tuple[bool, str]:
+    """Return ``(stale, normalized)`` for one submitted batch credential.
+
+    Two identity styles are accepted:
+
+    * opaque tokens (e.g. persisted UUID) must match the current token exactly;
+    * numeric / ``r3`` style credentials are treated as a revision floor: a
+      successful import logged after that revision means the batch was
+      replaced.  Callback revisions deliberately do not make a form stale.
+    """
+
+    if value is None or isinstance(value, bool):
+        return False, ""
+
+    number: Optional[int] = None
+    text = str(value).strip()
+    if isinstance(value, int):
+        number = int(value)
+        text = str(value)
+    elif not text:
+        return False, ""
+    else:
+        # Tolerate HTTP ETag style values: W/"token" or "token".
+        if text[:2] in ('W/"', "w/\""):
+            text = text[2:]
+        if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+            text = text[1:-1]
+        text = text.strip()
+        if text.isdigit():
+            number = int(text)
+        else:
+            match = _PREFIXED_NUMBER_RE.fullmatch(text)
+            if match:
+                number = int(match.group(1))
+
+    if number is not None:
+        import_floor = latest_import_revision
+        if import_floor is None:
+            import_floor = batch_revision
+        return import_floor > number, text
+
+    # Opaque token.  When the database has no token yet there is nothing to
+    # compare against; do not block the submission.
+    if batch_token is None:
+        return False, text
+    return text != batch_token, text
+
+
+def _collect_credentials(
+    expected_batch: Any,
+    kwargs: Dict[str, Any],
+) -> List[Any]:
+    # The shared alias table lives at module scope so the HTTP layer can use
+    # exactly the same recognition rules.
+    credential_keys = CREDENTIAL_FIELD_KEYS
+    values: List[Any] = []
+
+    def add(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                add(item)
+            return
+        values.append(value)
+
+    add(expected_batch)
+    web_credentials = kwargs.pop("web_credentials", None)
+    add(web_credentials)
+    for key in credential_keys:
+        if key in kwargs:
+            add(kwargs[key])
+    # Tolerate additional naming variants without weakening the no-credential
+    # path: any extra keyword a caller attaches to this service is treated as a
+    # potential batch credential (booleans/None are ignored by the checker).
+    for key, value in kwargs.items():
+        if key in credential_keys:
+            continue
+        add(value)
+    return values
+
+
+def submit_callbacks(
+    db_path: Path | str | None,
+    payload: Any,
+    expected_batch: Any = None,
+    **credential_kwargs: Any,
+) -> Dict[str, Any]:
+    credential_values = _collect_credentials(expected_batch, credential_kwargs)
+
     items, parse_errors = parse_callback_payload(payload)
     merged, batch_errors, internal_duplicates = merge_callback_items(items)
     errors = list(parse_errors) + list(batch_errors)
 
     if not merged and not errors:
         errors.append("没有解析到任何回访答案；请按户号提供至少一个要补的空项。")
-    if errors:
-        raise BatchRejected("回访批次未通过解析/批次内一致性校验，已整批退回。", errors)
 
     with closing(connect(db_path)) as conn:
         # An immediate write transaction serializes concurrent batches.  All
@@ -111,6 +324,51 @@ def submit_callbacks(db_path: Path | str | None, payload: Any) -> Dict[str, Any]
             ) from exc
 
         try:
+            # Batch-generation guard for server-rendered web forms.  This runs
+            # after the write lock is acquired on purpose: if a re-import held
+            # the lock first and committed a new survey batch while this
+            # callback was waiting, the credential check below observes the
+            # replacement and rejects the ENTIRE callback batch.  JSON/API
+            # callers that send no credential keep the original behavior.
+            if credential_values:
+                current_token = get_batch_id(conn)
+                current_batch_revision = get_batch_revision(conn)
+                latest_import_revision = get_latest_import_revision(conn)
+                stale_credential: Any = None
+                for credential in credential_values:
+                    stale, _normalized = _credential_is_stale(
+                        credential,
+                        batch_token=current_token,
+                        batch_revision=current_batch_revision,
+                        latest_import_revision=latest_import_revision,
+                    )
+                    if stale:
+                        stale_credential = credential
+                        break
+                if stale_credential is not None:
+                    raise StaleBatchRejected(
+                        "调查已被重新导入并更换批次；你提交的回访来自旧页面，"
+                        "已整批退回，没有写入新批。",
+                        [
+                            "数据库中的逐户调查刚刚被重新导入（包括重新载入样例），"
+                            "户号可能相同但答案口径已经是新批。",
+                            "请核对本页下方户表是否为最新批次，再参照新批重新填写回访；"
+                            "旧表单里的答案不会自动填入新表单。",
+                        ],
+                        expected=stale_credential,
+                        current_batch_id=current_token,
+                        current_batch_revision=(
+                            latest_import_revision
+                            if latest_import_revision is not None
+                            else current_batch_revision
+                        ),
+                    )
+
+            if errors:
+                raise BatchRejected(
+                    "回访批次未通过解析/批次内一致性校验，已整批退回。", errors
+                )
+
             total = get_district_total(conn)
             if total is None:
                 raise BatchRejected(

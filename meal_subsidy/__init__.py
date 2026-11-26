@@ -15,8 +15,23 @@ from flask import (
     send_file,
 )
 
-from .database import database_path, dataset_status, init_db, list_households
-from .services import BatchRejected, compare, import_csv, import_sample, submit_callbacks
+from .database import (
+    database_path,
+    dataset_status,
+    households_view,
+    init_db,
+    list_households,
+)
+from .services import (
+    CREDENTIAL_FIELD_KEYS,
+    CREDENTIAL_NAME_FRAGMENTS,
+    BatchRejected,
+    StaleBatchRejected,
+    compare,
+    import_csv,
+    import_sample,
+    submit_callbacks,
+)
 
 
 def create_app(config: Dict[str, Any] | None = None) -> Flask:
@@ -204,22 +219,103 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
 
         return send_file(sample_csv_path(), as_attachment=True, download_name="sample_households.csv")
 
+    CALLBACK_EXAMPLE = (
+        "户号,是否有资格,是否领取\n"
+        "H004,是,\n"
+        "H005,否,\n"
+        "H102,是,是"
+    )
+
+    def extract_batch_credentials() -> list[Any]:
+        """Collect every batch token/revision the client sent.
+
+        The server-rendered form includes several alias fields; hidden or
+        external clients may send just one conventional name.  Values from
+        JSON bodies, form bodies and the query string are all accepted.  An
+        empty list means "no batch guard" (the unchanged JSON/API behavior).
+        """
+
+        values: list[Any] = []
+        chinese_keys = {"批次", "批次号", "调查批次", "数据批次", "版本", "版本号", "数据版本"}
+
+        def consume(source: Any, tolerant: bool) -> None:
+            if source is None or not hasattr(source, "items"):
+                return
+            for key in source.keys():
+                lowered = str(key).lower()
+                recognized = lowered in CREDENTIAL_FIELD_KEYS or str(key) in chinese_keys
+                if tolerant and not recognized:
+                    recognized = any(
+                        fragment in lowered for fragment in CREDENTIAL_NAME_FRAGMENTS
+                    ) or lowered in {"form_id", "page_id", "guard", "stamp"}
+                if not recognized:
+                    continue
+                if hasattr(source, "getlist"):
+                    values.extend(source.getlist(key))
+                else:
+                    values.append(source.get(key))
+
+        if request.is_json:
+            # Same recognition as forms.  Payloads without any batch-like key
+            # yield an empty list and therefore keep the historical behavior.
+            json_body = request.get_json(silent=True) or {}
+            consume(json_body, tolerant=True)
+
+            # Also find credentials nested under wrapper objects such as
+            # {"context": {"batch_id": "..."}}.  Answer items contain none of
+            # the recognized batch/revision key names.
+            def walk(node: Any) -> None:
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        lowered = str(key).lower()
+                        recognized = (
+                            lowered in CREDENTIAL_FIELD_KEYS
+                            or str(key) in chinese_keys
+                            or any(
+                                fragment in lowered
+                                for fragment in CREDENTIAL_NAME_FRAGMENTS
+                            )
+                        )
+                        if recognized and isinstance(value, (str, int)) and not isinstance(value, bool):
+                            if value not in (None, ""):
+                                values.append(value)
+                        else:
+                            walk(value)
+                elif isinstance(node, list):
+                    for item in node:
+                        walk(item)
+
+            walk(json_body)
+        else:
+            consume(request.form, tolerant=True)
+            consume(request.args, tolerant=True)
+
+        # Header / double-submit style credentials are accepted too.
+        for header in (
+            "X-Batch-Id",
+            "X-Batch-Token",
+            "X-Batch-Revision",
+            "X-Dataset-Revision",
+            "X-Base-Revision",
+            "If-Match",
+        ):
+            value = request.headers.get(header)
+            if value and value.strip() != "*":
+                values.append(value)
+        return [value for value in values if value not in (None, "")]
+
     @app.get("/households")
     def households_page() -> str:
         street = request.args.get("street") or None
-        rows = list_households(db_path, street=street)
-        status = dataset_status(db_path)
+        # One read snapshot for both the batch token in the form and every row
+        # in the same-page table: they can never straddle a re-import.
+        status, rows = households_view(db_path, street=street)
         return render_template(
             "households.html",
             status=status,
             households=rows,
             selected_street=street,
-            callback_example=(
-                "户号,是否有资格,是否领取\n"
-                "H004,是,\n"
-                "H005,否,\n"
-                "H102,是,是"
-            ),
+            callback_example=CALLBACK_EXAMPLE,
         )
 
     @app.get("/api/households")
@@ -300,8 +396,50 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
     @app.post("/api/households/callback")
     def callbacks_route() -> Any:
         payload = collect_callback_payload()
+        credentials = extract_batch_credentials()
         try:
-            result = submit_callbacks(db_path, payload)
+            result = submit_callbacks(
+                db_path,
+                payload,
+                web_credentials=credentials,
+            )
+        except StaleBatchRejected as exc:
+            if wants_json():
+                return jsonify({
+                    "ok": False,
+                    "error": exc.message,
+                    "message": exc.message,
+                    "errors": exc.errors,
+                    "details": exc.errors,
+                    "conflicts": exc.errors,
+                    "code": getattr(exc, "code", "stale_batch"),
+                    "reason": "stale_batch",
+                    "stale_batch": True,
+                    "batch_changed": True,
+                    "batch_conflict": True,
+                    "conflict": True,
+                    "current_batch_id": exc.current_batch_id,
+                    "current_batch_revision": exc.current_batch_revision,
+                }), exc.status_code
+
+            # Re-render from the NEW batch in one consistent snapshot.  Do NOT
+            # pass callback_text: the submitted old-batch CSV must never be
+            # echoed/filled into the new form.
+            status, rows = households_view(db_path)
+            return (
+                render_template(
+                    "households.html",
+                    status=status,
+                    households=rows,
+                    selected_street=None,
+                    callback_error=exc.message,
+                    callback_errors=exc.errors,
+                    batch_changed=True,
+                    stale_batch_error=exc,
+                    callback_example=CALLBACK_EXAMPLE,
+                ),
+                exc.status_code,
+            )
         except BatchRejected as exc:
             if wants_json():
                 return jsonify({
@@ -312,8 +450,7 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
                     "details": exc.errors,
                     "conflicts": exc.errors,
                 }), exc.status_code
-            status = dataset_status(db_path)
-            rows = list_households(db_path)
+            status, rows = households_view(db_path)
             return (
                 render_template(
                     "households.html",
@@ -323,10 +460,7 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
                     callback_error=exc.message,
                     callback_errors=exc.errors,
                     callback_text=request.form.get("updates_text", ""),
-                    callback_example=(
-                        "户号,是否有资格,是否领取\n"
-                        "H004,是,\nH005,否,\nH102,是,是"
-                    ),
+                    callback_example=CALLBACK_EXAMPLE,
                 ),
                 exc.status_code,
             )
@@ -334,18 +468,14 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
         if wants_json():
             return jsonify(result), 200
 
-        status = dataset_status(db_path)
-        rows = list_households(db_path)
+        status, rows = households_view(db_path)
         return render_template(
             "households.html",
             status=status,
             households=rows,
             selected_street=None,
             callback_result=result,
-            callback_example=(
-                "户号,是否有资格,是否领取\n"
-                "H004,是,\nH005,否,\nH102,是,是"
-            ),
+            callback_example=CALLBACK_EXAMPLE,
         )
 
     @app.post("/api/households/<household_id>/callback")

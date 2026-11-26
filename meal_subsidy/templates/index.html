@@ -31,7 +31,7 @@
       </div>
     {% endif %}
 
-    <form id="import-form" action="{{ url_for('import_route') }}" method="post" enctype="multipart/form-data" class="form">
+    <form id="import-form" action="/import" method="post" enctype="multipart/form-data" class="form">
       <label>
         逐户 CSV 文件
         <input id="csv-file" type="file" name="file" accept=".csv,text/csv" required>
@@ -50,7 +50,7 @@
       <h2>没有文件？先试可试样例</h2>
       <p class="muted">样例含 3 条街道、16 户和若干漏答项；核定全区合资格户数为 8。</p>
       <div class="actions">
-        <form action="{{ url_for('sample_load') }}" method="post">
+        <form action="/sample/load" method="post">
           <button class="button" id="load-sample" type="submit" data-testid="load-sample">一键载入库内样例</button>
         </form>
         <a class="button ghost" href="{{ url_for('sample_csv') }}">下载样例 CSV</a>

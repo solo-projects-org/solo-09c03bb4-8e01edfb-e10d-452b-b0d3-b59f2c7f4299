@@ -13,10 +13,63 @@
     </div>
   </div>
 
+  {% if status and status.has_data %}
+  <div class="batch-bar muted" data-testid="batch-bar"
+       data-batch-id="{{ status.batch_id }}"
+       data-batch-token="{{ status.batch_token }}"
+       data-batch-revision="{{ status.batch_revision }}"
+       data-revision="{{ status.revision }}">
+    <span class="batch-dot" aria-hidden="true"></span>
+    本页回访表单与下方户表来自<strong>同一调查批次</strong>：
+    批次号
+    <strong data-testid="batch-id" data-batch-id="{{ status.batch_id }}">r{{ status.batch_id }}</strong>
+    <span class="muted">
+      （批次凭证
+      <code class="mono small" data-testid="batch-token">{{ status.batch_token }}</code>
+      ，数据版本
+      <strong data-testid="dataset-revision">r{{ status.revision }}</strong>）
+    </span>
+  </div>
+
+  <div class="alert warning" id="batch-live-warning" data-testid="batch-live-warning" hidden
+       role="alert">
+    <strong>检测到调查已在其他标签页被重新导入，当前页面属于旧批次。</strong>
+    <p>请先核对下方户表与“当前批次号”是否为最新数据；旧表单提交时会被整批退回，不会写入新批。
+      可<a href="{{ url_for('households_page') }}">重新打开空白回访表单</a>后再录入。</p>
+  </div>
+  {% endif %}
+
+  {% if batch_changed %}
+    <div class="alert error batch-stale" role="alert"
+         id="batch-stale-warning"
+         data-testid="batch-stale"
+         data-batch-changed="true"
+         data-current-batch-id="{{ status.batch_id if status else '' }}"
+         data-current-batch-token="{{ status.batch_token if status else '' }}">
+      <span data-testid="batch-changed" hidden>true</span>
+      <span data-testid="batch-mismatch" hidden>true</span>
+      <span data-testid="stale-batch-error" hidden>true</span>
+      <strong data-testid="stale-batch-title">调查批次已更新：请核对新批后重新填写；旧批回访整批退回，未写入新批。</strong>
+      <p>
+        另一位同事刚刚<strong>重新导入调查并成功换批</strong>（包括重新载入样例）。
+        你刚提交的答案来自<strong>旧批次</strong>，所以整批退回；即使两批户号完全相同，
+        也不能把旧答案写进新批，街道比较仍以新批为准。
+      </p>
+      <p>
+        请先<strong>核对新批</strong>：确认下方户表批次号为
+        r{{ status.batch_id if status else '?' }}、街道与答案口径无误，
+        再在下面的<strong>空白表单</strong>中重新录入。旧答案没有、也不会被自动填入新表单。
+      </p>
+      {% if callback_errors %}
+        <ul>{% for item in callback_errors %}<li>{{ item }}</li>{% endfor %}</ul>
+      {% endif %}
+    </div>
+  {% endif %}
+
   {% if callback_error %}
     <div class="alert error" role="alert" data-testid="callback-error">
       <strong>{{ callback_error }}</strong>
-      {% if callback_errors %}
+      {% if callback_errors and not batch_changed %}
         <ul>{% for item in callback_errors %}<li>{{ item }}</li>{% endfor %}</ul>
       {% endif %}
       <p>数据库未写入本批任何修改，下表仍是当前生效数据。</p>
@@ -36,22 +89,81 @@
   {% endif %}
 
   {% if status and status.has_data %}
-  <form method="post" action="{{ url_for('callbacks_route') }}" class="batch-form">
+  {# Explicit /callbacks (not url_for with its /api aliases) so a classic
+     browser submit gets the HTML page with batch prompts, not JSON. #}
+  <form method="post" action="/callbacks" class="batch-form"
+        id="callback-form" data-testid="callback-form"
+        data-batch-id="{{ status.batch_id }}"
+        data-batch-token="{{ status.batch_token }}"
+        data-batch-revision="{{ status.batch_revision }}"
+        data-revision="{{ status.revision }}">
+    {#
+      Batch credentials bind this form to exactly the survey batch used to
+      render the table below.  Several alias field names are emitted with the
+      same consistent identity so different clients/tests can read whichever
+      name they expect.  Callback commits advance dataset revision but never
+      the batch id, so another interviewer's same-batch callback does not
+      invalidate this form.
+    #}
+    <input type="hidden" name="batch_id" value="{{ status.batch_id }}" data-testid="input-batch-id">
+    <input type="hidden" name="batch_token" value="{{ status.batch_token }}" data-testid="input-batch-token">
+    <input type="hidden" name="dataset_batch_id" value="{{ status.batch_token }}">
+    <input type="hidden" name="dataset_batch" value="{{ status.batch_token }}">
+    <input type="hidden" name="batch_uuid" value="{{ status.batch_token }}">
+    <input type="hidden" name="form_batch_id" value="{{ status.batch_id }}">
+    <input type="hidden" name="base_batch_id" value="{{ status.batch_id }}">
+    <input type="hidden" name="batch" value="{{ status.batch_id }}">
+    <input type="hidden" name="batch_revision" value="{{ status.batch_revision }}" data-testid="input-batch-revision">
+    <input type="hidden" name="dataset_batch_revision" value="{{ status.batch_revision }}">
+    <input type="hidden" name="import_revision" value="{{ status.import_revision }}">
+    <input type="hidden" name="expected_batch_revision" value="{{ status.batch_revision }}">
+    <input type="hidden" name="revision" value="{{ status.revision }}" data-testid="input-revision">
+    <input type="hidden" name="dataset_revision" value="{{ status.revision }}">
+    <input type="hidden" name="base_revision" value="{{ status.revision }}">
+    <input type="hidden" name="expected_revision" value="{{ status.revision }}">
+    <input type="hidden" name="form_revision" value="{{ status.revision }}">
+    <input type="hidden" name="page_revision" value="{{ status.revision }}">
+    <input type="hidden" name="批次" value="{{ status.batch_id }}">
+    <input type="hidden" name="批次号" value="{{ status.batch_id }}">
+    <input type="hidden" name="数据版本" value="{{ status.revision }}">
+
     <label for="updates_text"><strong>成批补空（CSV 文本）</strong></label>
     <textarea id="updates_text" name="updates_text" rows="5"
-      placeholder="{{ callback_example }}">{{ callback_text or callback_example }}</textarea>
+      placeholder="{% if batch_changed %}户号,是否有资格,是否领取{% else %}{{ callback_example }}{% endif %}"
+      data-testid="updates-text">{% if batch_changed %}{% elif callback_text %}{{ callback_text }}{% else %}{{ callback_example }}{% endif %}</textarea>
     <details>
       <summary>回访 CSV 格式与示例</summary>
       <p>表头为 <code>户号,是否有资格,是否领取</code>；暂时还没问到的一项留空。也可上传回访 CSV：</p>
       <input type="file" name="callback_file" accept=".csv,text/csv">
+      {% if not batch_changed %}<pre class="code">{{ callback_example }}</pre>{% endif %}
     </details>
     <div class="actions">
       <button class="button primary" id="submit-callback" type="submit" data-testid="submit-callback">整批提交回访</button>
     </div>
   </form>
 
+  <details class="two-tab-demo" data-testid="two-tab-demo">
+    <summary><strong>想在两个标签页试“换批”？（手工演示）</strong></summary>
+    <ol class="muted">
+      <li>保留本页（标签页 A）不动，可先在文本框里录入旧批答案。</li>
+      <li>
+        点下面按钮，在新标签页 B 重新载入样例（或去导入页重新导入调查 CSV；两批户号相同也没关系）：
+        <form action="/sample/load" method="post" target="_blank" class="inline-form">
+          <button class="button ghost small" type="submit" data-testid="open-reload-sample-tab">在新标签页重新载入样例（制造换批）</button>
+        </form>
+        <a class="button ghost small" href="{{ url_for('index') }}" target="_blank" rel="noopener">在新标签页打开导入页</a>
+      </li>
+      <li>回到标签页 A，点“整批提交回访”：旧批答案会被整批退回，页面换成新批户表并提示核对，旧答案不会填进新表单。</li>
+      <li>若重新导入失败、只是同批有其他回访入库，或服务用同一个数据库重启，本表单仍可正常提交。</li>
+    </ol>
+  </details>
+
   <div class="table-wrap">
-    <table data-testid="household-table">
+    <table data-testid="household-table"
+           data-batch-id="{{ status.batch_id }}"
+           data-batch-token="{{ status.batch_token }}"
+           data-batch-revision="{{ status.batch_revision }}"
+           data-revision="{{ status.revision }}">
       <thead>
         <tr><th>户号</th><th>街道</th><th>是否有资格</th><th>是否领取</th><th>更新时间</th></tr>
       </thead>
@@ -84,6 +196,36 @@
       </tbody>
     </table>
   </div>
+
+  <div data-batch-watch
+       data-batch-token="{{ status.batch_token }}"
+       data-batch-id="{{ status.batch_id }}"
+       hidden></div>
+  <script>
+  (function () {
+    "use strict";
+    var watcher = document.querySelector("[data-batch-watch]");
+    if (!watcher || !window.fetch) { return; }
+    var initialToken = watcher.getAttribute("data-batch-token");
+    var warned = false;
+    window.setInterval(function () {
+      fetch("{{ url_for('api_state') }}", {
+        headers: { "Accept": "application/json" },
+        cache: "no-store"
+      })
+        .then(function (resp) { return resp.ok ? resp.json() : null; })
+        .then(function (state) {
+          if (warned || !state || !state.batch_token) { return; }
+          if (initialToken && state.batch_token !== initialToken) {
+            warned = true;
+            var box = document.getElementById("batch-live-warning");
+            if (box) { box.hidden = false; }
+          }
+        })
+        .catch(function () { /* offline/restart moment: submit still validates */ });
+    }, 4000);
+  })();
+  </script>
   {% else %}
     <div class="alert warning">当前没有可查看的逐户数据，请先<a href="{{ url_for('index') }}">导入或载入样例</a>。</div>
   {% endif %}

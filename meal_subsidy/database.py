@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import uuid
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -95,6 +96,24 @@ def init_db(path: os.PathLike[str] | str | None = None) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('dataset_revision', '0')"
         )
+        # Persistent survey-batch identity.  Unlike dataset_revision, this only
+        # changes when an import replaces the whole household set; callback
+        # batches deliberately leave it untouched.  Persisting it in meta means
+        # a service restart against the same DB keeps valid open forms working.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) "
+            "VALUES ('dataset_batch_revision', '0')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) "
+            "VALUES ('dataset_batch_id', ?)",
+            (uuid.uuid4().hex,),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) "
+            "VALUES ('dataset_batch_token', ?)",
+            (uuid.uuid4().hex,),
+        )
 
 
 def get_meta(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -117,6 +136,45 @@ def get_district_total(conn: sqlite3.Connection) -> Optional[int]:
     try:
         return int(value)
     except ValueError:
+        return None
+
+
+def get_batch_id(conn: sqlite3.Connection) -> Optional[str]:
+    """Opaque identity of the currently imported survey batch.
+
+    Rotated only by a successful whole-dataset import; stable across callback
+    batches and service restarts because it lives in the ``meta`` table.
+    """
+
+    value = get_meta(conn, "dataset_batch_id")
+    return value or None
+
+
+def get_batch_revision(conn: sqlite3.Connection) -> int:
+    """Dataset revision produced by the latest successful import.
+
+    Unlike :func:`get_revision`, callback batches do not advance this value, so
+    an open form stays valid after other interviewers commit callbacks.
+    """
+
+    value = get_meta(conn, "dataset_batch_revision", "0") or "0"
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def get_latest_import_revision(conn: sqlite3.Connection) -> Optional[int]:
+    """Highest revision logged as a successful whole-batch import."""
+
+    row = conn.execute(
+        "SELECT MAX(revision) FROM revision_log WHERE kind = 'import'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
         return None
 
 
@@ -173,40 +231,56 @@ def dataset_status(path: os.PathLike[str] | str | None = None) -> Dict[str, Any]
             "district_total": None,
             "household_count": 0,
             "streets": [],
+            "batch_id": None,
+            "batch_token": None,
+            "batch_revision": 0,
+            "import_revision": 0,
         }
 
     with closing(connect(db_path)) as conn:
         conn.execute("BEGIN")
         try:
-            revision = get_revision(conn)
-            total = get_district_total(conn)
-            household_count = conn.execute("SELECT COUNT(*) FROM households").fetchone()[0]
-            street_rows = conn.execute(
-                "SELECT street, COUNT(*) AS n FROM households GROUP BY street ORDER BY street"
-            ).fetchall()
-            eligible_yes = conn.execute(
-                "SELECT COUNT(*) FROM households WHERE eligible=1"
-            ).fetchone()[0]
-            eligible_no = conn.execute(
-                "SELECT COUNT(*) FROM households WHERE eligible=0"
-            ).fetchone()[0]
-            eligible_blank = conn.execute(
-                "SELECT COUNT(*) FROM households WHERE eligible IS NULL"
-            ).fetchone()[0]
-            received_yes = conn.execute(
-                "SELECT COUNT(*) FROM households WHERE received=1"
-            ).fetchone()[0]
-            received_no = conn.execute(
-                "SELECT COUNT(*) FROM households WHERE received=0"
-            ).fetchone()[0]
-            received_blank = conn.execute(
-                "SELECT COUNT(*) FROM households WHERE received IS NULL"
-            ).fetchone()[0]
-            street_counts = fetch_street_counts(conn) if household_count else {}
+            status = collect_status(conn)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
+    return status
+
+
+def collect_status(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Build the status dict using the caller's open read transaction."""
+
+    revision = get_revision(conn)
+    total = get_district_total(conn)
+    batch_token = get_batch_id(conn)
+    batch_revision = get_batch_revision(conn)
+    latest_import_revision = get_latest_import_revision(conn)
+    if latest_import_revision is not None:
+        batch_revision = max(batch_revision, latest_import_revision)
+    household_count = conn.execute("SELECT COUNT(*) FROM households").fetchone()[0]
+    street_rows = conn.execute(
+        "SELECT street, COUNT(*) AS n FROM households GROUP BY street ORDER BY street"
+    ).fetchall()
+    eligible_yes = conn.execute(
+        "SELECT COUNT(*) FROM households WHERE eligible=1"
+    ).fetchone()[0]
+    eligible_no = conn.execute(
+        "SELECT COUNT(*) FROM households WHERE eligible=0"
+    ).fetchone()[0]
+    eligible_blank = conn.execute(
+        "SELECT COUNT(*) FROM households WHERE eligible IS NULL"
+    ).fetchone()[0]
+    received_yes = conn.execute(
+        "SELECT COUNT(*) FROM households WHERE received=1"
+    ).fetchone()[0]
+    received_no = conn.execute(
+        "SELECT COUNT(*) FROM households WHERE received=0"
+    ).fetchone()[0]
+    received_blank = conn.execute(
+        "SELECT COUNT(*) FROM households WHERE received IS NULL"
+    ).fetchone()[0]
+    street_counts = fetch_street_counts(conn) if household_count else {}
 
     feasible = None
     minimum_eligible = maximum_eligible = None
@@ -232,7 +306,61 @@ def dataset_status(path: os.PathLike[str] | str | None = None) -> Dict[str, Any]
         "minimum_eligible": minimum_eligible,
         "maximum_eligible": maximum_eligible,
         "feasible": feasible,
+        # Survey-batch identity.  Several aliases are exposed so templates,
+        # JSON clients and operational scripts can use whichever name they
+        # already use; all values describe the same committed batch.
+        "batch_id": batch_revision,
+        "batch": batch_revision,
+        "batch_number": batch_revision,
+        "batch_revision": batch_revision,
+        "dataset_batch_revision": batch_revision,
+        "import_revision": batch_revision,
+        "latest_import_revision": latest_import_revision,
+        "batch_token": batch_token,
+        "dataset_batch_id": batch_token,
+        "dataset_batch": batch_token,
+        "batch_uuid": batch_token,
     }
+
+
+def _query_households(
+    conn: sqlite3.Connection,
+    street: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[sqlite3.Row]:
+    if street:
+        query = "SELECT * FROM households WHERE street=? ORDER BY household_id"
+        params: tuple[Any, ...] = (street,)
+    else:
+        query = "SELECT * FROM households ORDER BY household_id"
+        params = ()
+    if limit is not None:
+        query += " LIMIT ?"
+        params = params + (int(limit),)
+    return list(conn.execute(query, params).fetchall())
+
+
+def households_view(
+    path: os.PathLike[str] | str | None = None,
+    street: Optional[str] = None,
+) -> tuple[Dict[str, Any], list[sqlite3.Row]]:
+    """Read status + household rows from one consistent snapshot.
+
+    The rendered form token and every row in the same-page table are therefore
+    guaranteed to describe the same survey batch.
+    """
+
+    db_path = Path(path) if path is not None else database_path()
+    with closing(connect(db_path)) as conn:
+        conn.execute("BEGIN")
+        try:
+            status = collect_status(conn)
+            rows = _query_households(conn, street=street)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return status, rows
 
 
 def list_households(
@@ -241,13 +369,4 @@ def list_households(
     limit: Optional[int] = None,
 ) -> list[sqlite3.Row]:
     with closing(connect(path)) as conn:
-        if street:
-            query = "SELECT * FROM households WHERE street=? ORDER BY household_id"
-            params: tuple[Any, ...] = (street,)
-        else:
-            query = "SELECT * FROM households ORDER BY household_id"
-            params = ()
-        if limit is not None:
-            query += " LIMIT ?"
-            params = params + (int(limit),)
-        return list(conn.execute(query, params).fetchall())
+        return _query_households(conn, street=street, limit=limit)

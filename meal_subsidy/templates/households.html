@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}逐户数据与回访补空 · {{ app_name }}{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="page-head">
+    <div>
+      <h1>逐户数据与成批回访</h1>
+      <p class="muted">只补空项，不覆盖已有答案；相同答案重复提交不会增加“新补项数”。</p>
+    </div>
+    <div class="actions">
+      <a class="button" href="{{ url_for('compare_route') }}">去比较街道</a>
+      <a class="button ghost" href="{{ url_for('index') }}">返回导入</a>
+    </div>
+  </div>
+
+  {% if callback_error %}
+    <div class="alert error" role="alert" data-testid="callback-error">
+      <strong>{{ callback_error }}</strong>
+      {% if callback_errors %}
+        <ul>{% for item in callback_errors %}<li>{{ item }}</li>{% endfor %}</ul>
+      {% endif %}
+      <p>数据库未写入本批任何修改，下表仍是当前生效数据。</p>
+    </div>
+  {% endif %}
+
+  {% if callback_result %}
+    <div class="alert success" role="status" data-testid="callback-success">
+      <strong>{{ callback_result.message }}</strong>
+      <ul>
+        <li>生效数据版本：r{{ callback_result.revision }}</li>
+        <li>涉及户号：{{ callback_result.unique_households }} 户</li>
+        <li>实际新补空项：<span id="newly-filled" data-testid="newly-filled">{{ callback_result.newly_filled }}</span></li>
+        <li>相同答案重报未增计：<span id="unchanged" data-testid="unchanged">{{ callback_result.unchanged_answers }}</span> 项</li>
+      </ul>
+    </div>
+  {% endif %}
+
+  {% if status and status.has_data %}
+  <form method="post" action="{{ url_for('callbacks_route') }}" class="batch-form">
+    <label for="updates_text"><strong>成批补空（CSV 文本）</strong></label>
+    <textarea id="updates_text" name="updates_text" rows="5"
+      placeholder="{{ callback_example }}">{{ callback_text or callback_example }}</textarea>
+    <details>
+      <summary>回访 CSV 格式与示例</summary>
+      <p>表头为 <code>户号,是否有资格,是否领取</code>；暂时还没问到的一项留空。也可上传回访 CSV：</p>
+      <input type="file" name="callback_file" accept=".csv,text/csv">
+    </details>
+    <div class="actions">
+      <button class="button primary" id="submit-callback" type="submit" data-testid="submit-callback">整批提交回访</button>
+    </div>
+  </form>
+
+  <div class="table-wrap">
+    <table data-testid="household-table">
+      <thead>
+        <tr><th>户号</th><th>街道</th><th>是否有资格</th><th>是否领取</th><th>更新时间</th></tr>
+      </thead>
+      <tbody>
+      {% for row in households %}
+        <tr data-household="{{ row.household_id }}">
+          <td class="mono">{{ row.household_id }}</td>
+          <td>{{ row.street }}</td>
+          <td data-field="eligible" data-value="{{ row.eligible if row.eligible is not none else '' }}">
+            {% if row.eligible is none and row.received == 1 %}
+              <span class="tag yes implied" title="已知领取，按“领取者必有资格”推定为有资格">推定是</span>
+            {% else %}
+              <span class="tag {{ 'yes' if row.eligible == 1 else ('no' if row.eligible == 0 else 'blank') }}">
+                {{ row.eligible | yes_no_blank }}
+              </span>
+            {% endif %}
+          </td>
+          <td data-field="received" data-value="{{ row.received if row.received is not none else '' }}">
+            {% if row.received is none and row.eligible == 0 %}
+              <span class="tag no implied" title="已知无资格，按规则不可能领取，推定为未领取">推定否</span>
+            {% else %}
+              <span class="tag {{ 'yes' if row.received == 1 else ('no' if row.received == 0 else 'blank') }}">
+                {{ row.received | yes_no_blank }}
+              </span>
+            {% endif %}
+          </td>
+          <td class="muted mono small">{{ row.updated_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <div class="alert warning">当前没有可查看的逐户数据，请先<a href="{{ url_for('index') }}">导入或载入样例</a>。</div>
+  {% endif %}
+</section>
+{% endblock %}

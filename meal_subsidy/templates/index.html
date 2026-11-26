@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="grid two">
+  <div class="card">
+    <h1>导入逐户调查 CSV</h1>
+    <p class="muted">
+      每户一行，包含<strong>户号、街道、是否有资格、是否领取</strong>；后两项可留空。
+      领取答案为“是”的家庭，在任何补全中都必有资格。
+    </p>
+
+    {% if import_error %}
+      <div class="alert error" role="alert" data-testid="import-error">
+        <strong>{{ import_error }}</strong>
+        {% if import_errors %}
+          <ul>
+            {% for item in import_errors %}<li>{{ item }}</li>{% endfor %}
+          </ul>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {% if import_result %}
+      <div class="alert success" role="status" data-testid="import-success">
+        <strong>导入成功并已通过相容性核对。</strong>
+        <p>
+          数据版本 r{{ import_result.revision }}；共 {{ import_result.imported }} 户，
+          全区核定合资格户数 {{ import_result.district_total }}。
+          当前答案可补全的合格户数区间为
+          {{ import_result.summary.minimum_eligible }}–{{ import_result.summary.maximum_eligible }}。
+        </p>
+      </div>
+    {% endif %}
+
+    <form id="import-form" action="{{ url_for('import_route') }}" method="post" enctype="multipart/form-data" class="form">
+      <label>
+        逐户 CSV 文件
+        <input id="csv-file" type="file" name="file" accept=".csv,text/csv" required>
+      </label>
+      <label>
+        同批样本核定的全区合资格户数
+        <input id="district-total" name="district_total" type="number" min="0" step="1"
+               value="{{ form_total if form_total is defined else '' }}" required>
+      </label>
+      <div class="actions">
+        <button class="button primary" type="submit">导入并整批校验</button>
+      </div>
+    </form>
+
+    <div class="sample-box">
+      <h2>没有文件？先试可试样例</h2>
+      <p class="muted">样例含 3 条街道、16 户和若干漏答项；核定全区合资格户数为 8。</p>
+      <div class="actions">
+        <form action="{{ url_for('sample_load') }}" method="post">
+          <button class="button" id="load-sample" type="submit" data-testid="load-sample">一键载入库内样例</button>
+        </form>
+        <a class="button ghost" href="{{ url_for('sample_csv') }}">下载样例 CSV</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>当前生效数据</h2>
+    {% if status and status.has_data %}
+      <dl class="stats">
+        <div><dt>数据版本</dt><dd data-testid="revision">r{{ status.revision }}</dd></div>
+        <div><dt>户数</dt><dd>{{ status.household_count }}</dd></div>
+        <div><dt>街道数</dt><dd>{{ status.streets|length }}</dd></div>
+        <div><dt>全区核定合资格户数</dt><dd>{{ status.district_total }}</dd></div>
+        <div><dt>已知资格 是/否/空</dt>
+          <dd>{{ status.eligible_yes }} / {{ status.eligible_no }} / {{ status.eligible_blank }}</dd>
+        </div>
+        <div><dt>已知领取 是/否/空</dt>
+          <dd>{{ status.received_yes }} / {{ status.received_no }} / {{ status.received_blank }}</dd>
+        </div>
+        <div><dt>可补全合格户数</dt>
+          <dd>{{ status.minimum_eligible }}–{{ status.maximum_eligible }}</dd>
+        </div>
+      </dl>
+      {% if status.feasible %}
+        <div class="alert success">当前已知答案与全区核定数相容，仍可继续回访补空。</div>
+      {% else %}
+        <div class="alert error">当前数据与全区核定数不相容。</div>
+      {% endif %}
+      <div class="actions">
+        <a class="button primary" href="{{ url_for('households_page') }}">查看逐户并回访</a>
+        <a class="button" href="{{ url_for('compare_route') }}">比较两条街道</a>
+      </div>
+      {% if '人民路街道' in status.streets and '建设路街道' in status.streets %}
+        <p class="muted">
+          样例快捷比较：
+          <a href="{{ url_for('compare_route', street1='人民路街道', street2='建设路街道') }}">
+            人民路街道 − 建设路街道（-7/15 至 4/5）
+          </a>
+          ｜
+          <a href="{{ url_for('compare_route', street1='人民路街道', street2='湖滨街道') }}">
+            含分母可能为零提示
+          </a>
+        </p>
+      {% endif %}
+    {% else %}
+      <div class="alert warning">SQLite 已初始化，但还没有生效的逐户数据。请先导入或载入样例。</div>
+    {% endif %}
+
+    <h3>CSV 表头</h3>
+    <pre class="code">户号,街道,是否有资格,是否领取
+H001,幸福街道,是,是
+H002,幸福街道,否,
+H003,幸福街道,,否</pre>
+    <p class="muted">也支持英文表头 household_id, street, eligible, received，以及 yes/no、1/0、true/false。</p>
+  </div>
+</section>
+{% endblock %}

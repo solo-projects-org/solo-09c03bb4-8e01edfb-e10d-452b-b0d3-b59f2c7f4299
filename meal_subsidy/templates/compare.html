@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}街道领取率差值区间 · {{ app_name }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>比较两条街道的领取率差值</h1>
+  <p class="muted">
+    差值方向为<strong>第一条街道 − 第二条街道</strong>。区间已把全区核定合资格户数、
+    已知答案、“领取必有资格”和两条街道的同一次补全合并求解，不逐户枚举组合。
+  </p>
+
+  {% if not status or not status.has_data %}
+    <div class="alert warning">请先<a href="{{ url_for('index') }}">导入 CSV 和全区核定数</a>，或载入可试样例。</div>
+  {% else %}
+  <form id="compare-form" class="form compare-form" method="get" action="{{ url_for('compare_route') }}">
+    <label>
+      第一条街道（被减数）
+      <select id="street1" name="street1" required>
+        <option value="">请选择</option>
+        {% for street in status.streets %}
+          <option value="{{ street }}" {% if street == street1 %}selected{% endif %}>{{ street }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      第二条街道（减数）
+      <select id="street2" name="street2" required>
+        <option value="">请选择</option>
+        {% for street in status.streets %}
+          <option value="{{ street }}" {% if street == street2 %}selected{% endif %}>{{ street }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="actions align-end">
+      <button class="button primary" id="compare-submit" type="submit" data-testid="compare-submit">计算最小/最大值</button>
+    </div>
+  </form>
+
+  {% if comparison_error %}
+    <div class="alert error" data-testid="compare-error">
+      <strong>{{ comparison_error.message }}</strong>
+      <ul>{% for item in comparison_error.errors %}<li>{{ item }}</li>{% endfor %}</ul>
+    </div>
+  {% endif %}
+
+  {% if result %}
+    <div class="result-meta muted">
+      本次比较使用同一份生效快照：<strong data-testid="compare-revision">r{{ result.revision }}</strong>；
+      全区核定数 {{ result.district_total }}。
+    </div>
+
+    {% if result.zero_denominator_possible %}
+      <div class="alert warning" id="zero-warning" data-testid="zero-warning">
+        <strong>分母可能为零：</strong>
+        {% if result.zero_denominator_streets %}
+          {{ result.zero_denominator_streets|join('、') }} 存在合资格户数为 0 的补全。
+        {% else %}
+          所选街道存在分母为 0 的补全。
+        {% endif %}
+        下面的差值界只使用两条街道分母均为正的补全。
+      </div>
+    {% endif %}
+
+    {% if not result.positive_pair_exists %}
+      <div class="alert error" id="no-positive-completion" data-testid="no-positive-completion">
+        <strong>没有两条街道分母均为正的补全，因此不报差值。</strong>
+        {% if result.reason %}<p>{{ result.reason }}</p>{% endif %}
+      </div>
+    {% else %}
+      <div class="grid two bounds">
+        <div class="bound min">
+          <h2>可达到的最小值</h2>
+          <div class="big" id="min-value" data-testid="min-value">{{ result.min.percent }}</div>
+          <div class="fraction">精确值 {{ result.min.text }}（{{ '%.6f'|format(result.min.decimal) }}）</div>
+        </div>
+        <div class="bound max">
+          <h2>可达到的最大值</h2>
+          <div class="big" id="max-value" data-testid="max-value">{{ result.max.percent }}</div>
+          <div class="fraction">精确值 {{ result.max.text }}（{{ '%.6f'|format(result.max.decimal) }}）</div>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table data-testid="witness-table">
+          <thead>
+            <tr><th>界</th><th>{{ result.street_1 }} 领取/合资格</th><th>{{ result.street_2 }} 领取/合资格</th><th>其他街道合资格</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>最小值补全口径</td>
+              <td data-testid="min-witness-1">{{ result.min_witness.recipients_1 }} / {{ result.min_witness.eligible_1 }}</td>
+              <td data-testid="min-witness-2">{{ result.min_witness.recipients_2 }} / {{ result.min_witness.eligible_2 }}</td>
+              <td>{{ result.min_witness.eligible_other }}</td>
+            </tr>
+            <tr>
+              <td>最大值补全口径</td>
+              <td data-testid="max-witness-1">{{ result.max_witness.recipients_1 }} / {{ result.max_witness.eligible_1 }}</td>
+              <td data-testid="max-witness-2">{{ result.max_witness.recipients_2 }} / {{ result.max_witness.eligible_2 }}</td>
+              <td>{{ result.max_witness.eligible_other }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">
+        上表是达到边界的聚合计数口径；每一类漏答户都可按类别内任意安排实现，因此无需也不会逐户枚举组合。
+      </p>
+    {% endif %}
+  {% endif %}
+  {% endif %}
+</section>
+{% endblock %}

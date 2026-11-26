@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a class="brand" href="{{ url_for('index') }}">助餐补贴区间比对</a>
+    <nav>
+      <a href="{{ url_for('index') }}">导入</a>
+      <a href="{{ url_for('households_page') }}">逐户数据/回访</a>
+      <a href="{{ url_for('compare_route') }}">街道比较</a>
+      <a href="{{ url_for('sample_csv') }}">样例CSV</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container">
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="container footer">
+  <span>Flask + SQLite；所有冲突校验均在写入事务内完成。</span>
+</footer>
+</body>
+</html>
